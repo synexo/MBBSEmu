@@ -315,125 +315,145 @@ namespace MBBSEmu.HostProcess
                 //Process Channel Events
                 foreach (var session in _channelDictionary.Values)
                 {
-                    //Process a single incoming byte from the client session
-                    session.ProcessDataFromClient();
-
-                    //Handle GSBL Chain of Events
-                    if (!ProcessGSBLInputEvents(session))
+                    try
                     {
-                        session.DataToProcess = false;
-                        continue;
-                    }
+                        //Process a single incoming byte from the client session
+                        session.ProcessDataFromClient();
 
-                    //Handle Character based Events
-                    if (session.DataToProcess)
-                        ProcessIncomingCharacter(session);
-
-                    //Global Command Handler
-                    if (session.GetStatus() == EnumUserStatus.CR_TERMINATED_STRING_AVAILABLE && DoGlobalsAttribute.Get(session.SessionState))
-                    {
-                        //Transfer Input Buffer to Command Buffer, but don't clear it
-                        session.InputBuffer.WriteByte(0x0);
-                        session.InputCommand = session.InputBuffer.ToArray();
-
-                        //Check for Internal System Globals
-                        if (_globalRoutines.Any(g =>
-                            g.ProcessCommand(session.InputCommand, session.Channel, _channelDictionary, _modules)))
+                        //Handle GSBL Chain of Events
+                        if (!ProcessGSBLInputEvents(session))
                         {
-                            session.Status.Enqueue(EnumUserStatus.RINGING);
-                            session.InputBuffer.SetLength(0);
-
-                            //Redisplay Main Menu prompt after global if session is at Main Menu
-                            if (session.SessionState == EnumSessionState.MainMenuInput)
-                            {
-                                session.SessionState = EnumSessionState.MainMenuInputDisplay;
-                            }
-
-                            session.Status.Dequeue();
+                            session.DataToProcess = false;
                             continue;
                         }
 
-                        //Check for Module Globals
-                        foreach (var m in _modules.Values.Where(x => x.GlobalCommandHandlers.Any()))
+                        //Handle Character based Events
+                        if (session.DataToProcess)
+                            ProcessIncomingCharacter(session);
+
+                        //Global Command Handler
+                        if (session.GetStatus() == EnumUserStatus.CR_TERMINATED_STRING_AVAILABLE && DoGlobalsAttribute.Get(session.SessionState))
                         {
-                            var result = Run(m.ModuleIdentifier,
-                                m.GlobalCommandHandlers.First(), session.Channel);
+                            //Transfer Input Buffer to Command Buffer, but don't clear it
+                            session.InputBuffer.WriteByte(0x0);
+                            session.InputCommand = session.InputBuffer.ToArray();
 
-                            //Command Not Processed
-                            if (result == 0) continue;
-
-                            //Otherwise dequeue the input status to denote we've handled it
-                            session.Status.Dequeue();
-                            break;
-
-                        }
-                    }
-
-                    switch (session.SessionState)
-                    {
-                        case EnumSessionState.RloginEnteringModule:
+                            //Check for Internal System Globals
+                            if (_globalRoutines.Any(g =>
+                                g.ProcessCommand(session.InputCommand, session.Channel, _channelDictionary, _modules)))    
                             {
-                                ProcessLONROU_FromRlogin(session);
-                                break;
-                            }
-                        //Initial call to STTROU when a User is Entering a Module
-                        case EnumSessionState.EnteringModule:
-                            {
-                                ProcessSTTROU_EnteringModule(session);
-                                break;
-                            }
+                                session.Status.Enqueue(EnumUserStatus.RINGING);
+                                session.InputBuffer.SetLength(0);
 
-                        //Post-Login Display Routine
-                        case EnumSessionState.LoginRoutines:
-                            {
-                                ProcessLONROU(session);
-                                break;
-                            }
-
-                        //User is in the module, process all the in-module type of events
-                        case EnumSessionState.InModule:
-                            {
-                                //Did BTUCHI or a previous command cause a status change?
-                                if (session.GetStatus() == EnumUserStatus.CYCLE || session.GetStatus() == EnumUserStatus.OUTPUT_BUFFER_EMPTY)
+                                //Redisplay Main Menu prompt after global if session is at Main Menu
+                                if (session.SessionState == EnumSessionState.MainMenuInput)
                                 {
-                                    ProcessSTSROU(session);
+                                    session.SessionState = EnumSessionState.MainMenuInputDisplay;
+                                }
+
+                                session.Status.Dequeue();
+                                continue;
+                            }
+
+                            //Check for Module Globals
+                            foreach (var m in _modules.Values.Where(x => x.GlobalCommandHandlers.Any()))
+                            {
+                                var result = Run(m.ModuleIdentifier,
+                                    m.GlobalCommandHandlers.First(), session.Channel);
+
+                                //Command Not Processed
+                                if (result == 0) continue;
+
+                                //Otherwise dequeue the input status to denote we've handled it
+                                session.Status.Dequeue();
+                                break;
+
+                            }
+                        }
+
+                        switch (session.SessionState)
+                        {
+                            case EnumSessionState.RloginEnteringModule:
+                                {
+                                    ProcessLONROU_FromRlogin(session);
+                                    break;
+                                }
+                            //Initial call to STTROU when a User is Entering a Module
+                            case EnumSessionState.EnteringModule:
+                                {
+                                    ProcessSTTROU_EnteringModule(session);
                                     break;
                                 }
 
-                                //User Input Available? Invoke *STTROU
-                                if (session.GetStatus() == EnumUserStatus.CR_TERMINATED_STRING_AVAILABLE)
+                            //Post-Login Display Routine
+                            case EnumSessionState.LoginRoutines:
                                 {
-                                    ProcessSTTROU(session);
+                                    ProcessLONROU(session);
+                                    break;
                                 }
 
-                                //If the channel has been registered with BEGIN_POLLING
-                                if (session.PollingRoutine != null)
+                            //User is in the module, process all the in-module type of events
+                            case EnumSessionState.InModule:
                                 {
-                                    session.Status.Enqueue(EnumUserStatus.POLLING_STATUS);
-                                    ProcessPollingRoutine(session);
-                                    session.Status.Dequeue();
-                                }
-
-                                break;
-                            }
-
-                        //Check for any other session states, we handle these here as they are
-                        //lower priority than handling "in-module" states
-                        default:
-                            {
-                                foreach (var r in _mbbsRoutines)
-                                    if (r.ProcessSessionState(session, _modules))
+                                    //Did BTUCHI or a previous command cause a status change?
+                                    if (session.GetStatus() == EnumUserStatus.CYCLE || session.GetStatus() == EnumUserStatus.OUTPUT_BUFFER_EMPTY)
+                                    {
+                                        ProcessSTSROU(session);
                                         break;
+                                    }
 
-                            }
-                            break;
+                                    //User Input Available? Invoke *STTROU
+                                    if (session.GetStatus() == EnumUserStatus.CR_TERMINATED_STRING_AVAILABLE)
+                                    {
+                                        ProcessSTTROU(session);
+                                    }
+
+                                    //If the channel has been registered with BEGIN_POLLING
+                                    if (session.PollingRoutine != null)
+                                    {
+                                        session.Status.Enqueue(EnumUserStatus.POLLING_STATUS);
+                                        ProcessPollingRoutine(session);
+                                        session.Status.Dequeue();
+                                    }
+
+                                    break;
+                                }
+
+                            //Check for any other session states, we handle these here as they are
+                            //lower priority than handling "in-module" states
+                            default:
+                                {
+                                    foreach (var r in _mbbsRoutines)
+                                        if (r.ProcessSessionState(session, _modules))
+                                            break;
+
+                                }
+                                break;
+                        }
+
+                        //Mark Data Processing for this Channel as Complete
+                        session.DataToProcess = false;
+                        
                     }
+                    catch (Exception ex)
+                    {
+                        Logger.Error($"Unhandled exception on channel {session.Channel} (user: {session.Username}): {ex.Message}");
+                        Logger.Error(ex.StackTrace);
 
-                    //Mark Data Processing for this Channel as Complete
-                    session.DataToProcess = false;
-
+                        try
+                        {
+                        session.SendToClient("|RESET|\r\n|RED||B|An error occurred. Please reconnect and try again.|RESET|\r\n".EncodeToANSIArray());
+                        session.SessionState = EnumSessionState.LoggingOffProcessing;
+                        session.DataToProcess = false;
+                        }
+                        catch
+                        {
+                            Logger.Error($"Recovery also failed for channel {session.Channel}, forcing session to logged off state");
+                            session.SessionState = EnumSessionState.LoggedOff;
+                        }
+                    }
                 }
-
+                            
                 //Process Timed/Real-Time Events
                 ProcessRTKICK();
                 ProcessRTIHDLR();
