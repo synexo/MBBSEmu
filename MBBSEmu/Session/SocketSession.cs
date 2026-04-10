@@ -15,8 +15,10 @@ namespace MBBSEmu.Session
         protected readonly Thread _senderThread;
         protected readonly byte[] _socketReceiveBuffer = new byte[9000];
         protected readonly CancellationTokenSource _cancellationTokenSource = new CancellationTokenSource();
+        private DateTime _lastActivityTime = DateTime.UtcNow;
+        private int _idleTimeoutMinutes;
 
-        protected SocketSession(IMbbsHost mbbsHost, IMessageLogger logger, Socket socket, ITextVariableService textVariableService) : base(mbbsHost, socket.RemoteEndPoint.ToString(), EnumSessionState.Negotiating, textVariableService)
+        protected SocketSession(IMbbsHost mbbsHost, IMessageLogger logger, Socket socket, ITextVariableService textVariableService, AppSettingsManager configuration) : base(mbbsHost, socket.RemoteEndPoint.ToString(), EnumSessionState.Negotiating, textVariableService)
         {
             _logger = logger;
 
@@ -25,6 +27,8 @@ namespace MBBSEmu.Session
             _socket.ReceiveBufferSize = _socketReceiveBuffer.Length;
             _socket.SendBufferSize = 64 * 1024;
             _socket.Blocking = true;
+
+            _idleTimeoutMinutes = configuration.SessionIdleTimeoutMinutes;
 
             _senderThread = new Thread(SendWorker);
             _senderThread.Start();
@@ -123,6 +127,12 @@ namespace MBBSEmu.Session
         /// <returns>false to close connection and disconnect, otherwise true to continue</returns>
         protected virtual bool Heartbeat()
         {
+            if (_idleTimeoutMinutes > 0 &&
+                (DateTime.UtcNow - _lastActivityTime).TotalMinutes > _idleTimeoutMinutes)
+            {
+                _logger.Warn($"Session {SessionId} (Channel: {Channel}) idle for more than {_idleTimeoutMinutes} minutes, forcing disconnect");
+                return false;
+            }
             return true;
         }
 
@@ -158,6 +168,7 @@ namespace MBBSEmu.Session
 
             ValidateSocketState(socketError);
             ProcessIncomingClientData(bytesReceived);
+            _lastActivityTime = DateTime.UtcNow;
             ListenForData();
 
             _mbbsHost.TriggerProcessing();

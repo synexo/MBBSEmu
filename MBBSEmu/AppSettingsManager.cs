@@ -76,6 +76,7 @@ namespace MBBSEmu
         public string DatabaseFile => GetFileNameAppSettings("Database.File");
         public int BtrieveCacheSize => GetAppSettingsFromConfiguration<int>("Btrieve.CacheSize");
         public int TimerHertz => GetTimerHertz("Timer.Hertz");
+        public int SessionIdleTimeoutMinutes => GetAppSettingsFromConfiguration<int>("Session.IdleTimeoutMinutes");
 
         //Optional Keys
         public string GetBTURNO(string moduleId) => ConfigurationRoot[$"GSBL.BTURNO.{moduleId}"];
@@ -174,6 +175,10 @@ namespace MBBSEmu
                         return (T)value;
                     case "Btrieve.CacheSize":
                         value = 4;
+                        _logger.Warn($"{valueName} not specified in {Program._settingsFileName ?? Program.DefaultEmuSettingsFilename} -- setting default value: {value}");
+                        return (T)value;
+                    case "Session.IdleTimeoutMinutes":
+                        value = 30;
                         _logger.Warn($"{valueName} not specified in {Program._settingsFileName ?? Program.DefaultEmuSettingsFilename} -- setting default value: {value}");
                         return (T)value;
                     default:
