@@ -101,5 +101,12 @@ namespace MBBSEmu
         /// </summary>
         [JsonPropertyName("Account.DefaultKeys")]
         public string[] AccountDefaultKeys { get; set; }
+
+        /// <summary>
+        ///     Number of minutes of inactivity before a session is forcibly disconnected.
+        ///     Set to 0 to disable.
+        /// </summary>
+        [JsonPropertyName("Session.IdleTimeoutMinutes")]
+        public string SessionIdleTimeoutMinutes { get; set; }
     }
 }

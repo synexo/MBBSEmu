@@ -45,7 +45,7 @@ namespace MBBSEmu.Session.Telnet
 
         private readonly IacFilter _iacFilter;
 
-        public TelnetSession(IMbbsHost mbbsHost, IMessageLogger logger, Socket telnetConnection, AppSettingsManager configuration, ITextVariableService textVariableService) : base(mbbsHost, logger, telnetConnection, textVariableService)
+        public TelnetSession(IMbbsHost mbbsHost, IMessageLogger logger, Socket telnetConnection, AppSettingsManager configuration, ITextVariableService textVariableService) : base(mbbsHost, logger, telnetConnection, textVariableService, configuration)
         {
             SessionType = EnumSessionType.Telnet;
             SessionState = EnumSessionState.Unauthenticated;
@@ -65,6 +65,9 @@ namespace MBBSEmu.Session.Telnet
         /// <returns></returns>
         protected override bool Heartbeat()
         {
+            if (!base.Heartbeat())
+                return false;
+
             try
             {
                 if (_heartbeat)
