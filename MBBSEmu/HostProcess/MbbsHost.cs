@@ -49,6 +49,11 @@ namespace MBBSEmu.HostProcess
         private readonly PointerDictionary<SessionBase> _channelDictionary;
 
         /// <summary>
+        ///     Tracks when a session entered a disconnecting state, for stale session cleanup
+        /// </summary>
+        private readonly Dictionary<ushort, DateTime> _disconnectingSessionTimestamps = new();
+
+        /// <summary>
         ///     Dictionary containing all added Modules
         /// </summary>
         private readonly Dictionary<string, MbbsModule> _modules;
@@ -536,30 +541,66 @@ namespace MBBSEmu.HostProcess
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void ProcessDisconnects()
         {
-            // We only remove channels that are logged off
+            var now = Clock.Now;
+        
+            // Track sessions that are in a transitional/disconnecting state
+            foreach (var session in _channelDictionary.Values)
+            {
+                if (session.SessionState is EnumSessionState.LoggingOffProcessing
+                                          or EnumSessionState.LoggingOffDisplay
+                                          or EnumSessionState.Disconnected)
+                {
+                    if (!_disconnectingSessionTimestamps.ContainsKey(session.Channel))
+                    {
+                        _disconnectingSessionTimestamps[session.Channel] = now;
+                        Logger.Debug($"Channel {session.Channel} (user: {session.Username}) entered disconnecting state {session.SessionState}");
+                    }
+                }
+                else
+                {
+                    // Session recovered or moved on, remove from tracking
+                    _disconnectingSessionTimestamps.Remove(session.Channel);
+                }
+            }
+        
             RemoveSessions(session =>
-                session.SessionState == EnumSessionState.LoggedOff);
+            {
+                if (session.SessionState == EnumSessionState.LoggedOff)
+                    return true;
+        
+                // Force remove sessions stuck in a disconnecting state for more than 30 seconds
+                if (_disconnectingSessionTimestamps.TryGetValue(session.Channel, out var enteredAt) &&
+                    (now - enteredAt).TotalSeconds > 30)
+                {
+                    Logger.Warn($"Forcibly removing stale session on channel {session.Channel} (user: {session.Username}) stuck in {session.SessionState} for >{(now - enteredAt).TotalSeconds:F0}s");
+                    return true;
+                }
+        
+                return false;
+            });
+        
+            // Clean up timestamps for channels that were removed
+            var activeChannels = new HashSet<ushort>(_channelDictionary.Keys.Select(k => (ushort)k));
+            foreach (var key in _disconnectingSessionTimestamps.Keys.ToList())
+            {
+                if (!activeChannels.Contains(key))
+                    _disconnectingSessionTimestamps.Remove(key);
+            }
         }
 
         private void RemoveSessions(Predicate<SessionBase> match)
         {
-            // for removing channels sequentially, starting with the highest index to not break
-            // _channelDictionary
             Stack<ushort> channelsToRemove = new Stack<ushort>();
-
-            for (ushort i = 0; i < _channelDictionary.Count; i++)
+        
+            foreach (var key in _channelDictionary.Keys.ToList())
             {
-                //Because users might not be on sequential channels (0,1,3), we verify if the channel number
-                //is even in use first.
+                var i = (ushort)key;
                 if (!_channelDictionary.ContainsKey(i) || !match(_channelDictionary[i])) continue;
-
                 channelsToRemove.Push(i);
             }
-
+        
             while (channelsToRemove.Count > 0)
-            {
                 RemoveSession(channelsToRemove.Pop());
-            }
         }
 
         /// <summary>
