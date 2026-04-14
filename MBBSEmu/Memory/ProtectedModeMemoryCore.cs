@@ -19,12 +19,31 @@ namespace MBBSEmu.Memory
         private readonly Segment[] _segments = new Segment[0x10000];
         private readonly Instruction[][] _decompiledSegments = new Instruction[0x10000][];
 
-        private const ushort HEAP_BASE_SEGMENT = 0x1000; //0x1000->0x1FFF == 256MB
+        private const ushort HEAP_BASE_SEGMENT = 0x1000;    // heap starts here
+        private const ushort HEAP_CEILING_SEGMENT = 0x2FFF; // heap ends here: 2x original (512MB max)
         private FarPtr _nextHeapPointer = new FarPtr(HEAP_BASE_SEGMENT, 0);
-        private const ushort REALMODE_BASE_SEGMENT = 0x2000; //0x2000->0x2FFF == 256MB
+        private const ushort REALMODE_BASE_SEGMENT = 0x3000; // must be above HEAP_CEILING_SEGMENT
         private FarPtr _currentRealModePointer = new FarPtr(REALMODE_BASE_SEGMENT, 0);
         private readonly PointerDictionary<Dictionary<ushort, FarPtr>> _bigMemoryBlocks = new();
         private readonly Dictionary<ushort, MemoryAllocator> _heapAllocators = new();
+
+        /// <summary>
+        ///     Protects all heap state: _heapAllocators, _nextHeapPointer, and the
+        ///     MemoryAllocator instances they contain (whose _freeBlocks / RemainingBytes
+        ///     are not individually thread-safe).
+        ///
+        ///     RTIHDLR/SYSCYC (18 Hz background routines) and user-input processing can
+        ///     call Malloc/Free concurrently; without this lock the Dictionary iteration
+        ///     in Malloc races with Add in the new-segment path, and the LinkedList free
+        ///     lists inside each MemoryAllocator corrupt silently.
+        /// </summary>
+        private readonly object _heapLock = new();
+
+        /// <summary>
+        ///     Tracks the most recently created heap allocator so Malloc can try it first,
+        ///     avoiding an O(n) scan across all fragmented segments on every allocation.
+        /// </summary>
+        private MemoryAllocator _lastAllocator;
 
         public ProtectedModeMemoryCore(IMessageLogger logger) : base(logger)
         {
@@ -34,26 +53,55 @@ namespace MBBSEmu.Memory
 
         public override FarPtr Malloc(uint size)
         {
-            foreach (var allocator in _heapAllocators.Values)
+            lock (_heapLock)
             {
-                if (allocator.RemainingBytes < size)
-                    continue;
+                // Fast path: try the most recently created allocator first.
+                // The vast majority of allocations succeed here, avoiding the
+                // O(n) scan across all older (fragmented) segments.
+                if (_lastAllocator != null && _lastAllocator.RemainingBytes >= size)
+                {
+                    var ptr = _lastAllocator.Malloc(size);
+                    if (!ptr.IsNull())
+                        return ptr;
+                }
 
-                var ptr = allocator.Malloc(size);
-                if (!ptr.IsNull())
-                    return ptr;
+                // Slow path: scan all existing allocators.
+                foreach (var allocator in _heapAllocators.Values)
+                {
+                    if (allocator.RemainingBytes < size)
+                        continue;
+
+                    var ptr = allocator.Malloc(size);
+                    if (!ptr.IsNull())
+                        return ptr;
+                }
+
+                // All existing segments are full or too fragmented — create a new one.
+                if (_nextHeapPointer.Segment >= HEAP_CEILING_SEGMENT)
+                {
+                    _logger.Error($"Heap exhausted: all segments 0x{HEAP_BASE_SEGMENT:X4}-0x{HEAP_CEILING_SEGMENT:X4} consumed ({(HEAP_CEILING_SEGMENT - HEAP_BASE_SEGMENT) * 64}KB heap limit reached)");
+                    return FarPtr.Empty;
+                }
+
+                AddSegment(_nextHeapPointer.Segment);
+
+                // I hate null pointers/offsets so start the allocator at offset 2
+                var memoryAllocator = new MemoryAllocator(_logger, _nextHeapPointer + 2, 0xFFFE, alignment: 2);
+                _heapAllocators.Add(_nextHeapPointer.Segment, memoryAllocator);
+                _lastAllocator = memoryAllocator;
+
+                _nextHeapPointer.Segment++;
+
+                var segmentsUsed = _nextHeapPointer.Segment - HEAP_BASE_SEGMENT;
+                var totalSegments = HEAP_CEILING_SEGMENT - HEAP_BASE_SEGMENT;
+                var percentUsed = segmentsUsed * 100 / totalSegments;
+                var prevPercentUsed = (segmentsUsed - 1) * 100 / totalSegments;
+
+                if (percentUsed != prevPercentUsed && percentUsed % 10 == 0)
+                    _logger.Warn($"Heap usage at {percentUsed}%: {segmentsUsed} of {totalSegments} segments consumed ({segmentsUsed * 64}KB of {totalSegments * 64}KB)");
+
+                return memoryAllocator.Malloc(size);
             }
-
-            // no segment could allocate, create a new allocator to handle it
-            AddSegment(_nextHeapPointer.Segment);
-
-            // I hate null pointers/offsets so start the allocator at offset 2
-            var memoryAllocator = new MemoryAllocator(_logger, _nextHeapPointer + 2, 0xFFFE, alignment: 2);
-            _heapAllocators.Add(_nextHeapPointer.Segment, memoryAllocator);
-
-            _nextHeapPointer.Segment++;
-
-            return memoryAllocator.Malloc(size);
         }
 
         public override void Free(FarPtr ptr)
@@ -61,21 +109,43 @@ namespace MBBSEmu.Memory
             if (ptr.IsNull())
                 return;
 
-            if (!_heapAllocators.TryGetValue(ptr.Segment, out var memoryAllocator))
+            lock (_heapLock)
             {
-                _logger.Error($"Attempted to deallocate memory from an unknown segment {ptr}");
-                return;
-            }
+                if (!_heapAllocators.TryGetValue(ptr.Segment, out var memoryAllocator))
+                {
+                    _logger.Error($"Attempted to deallocate memory from an unknown segment {ptr}");
+                    return;
+                }
 
-            memoryAllocator.Free(ptr);
+                memoryAllocator.Free(ptr);
+            }
         }
 
         public int GetAllocatedMemorySize(FarPtr ptr)
         {
-            if (!_heapAllocators.TryGetValue(ptr.Segment, out var memoryAllocator))
-                return -1;
+            lock (_heapLock)
+            {
+                if (!_heapAllocators.TryGetValue(ptr.Segment, out var memoryAllocator))
+                    return -1;
 
-            return memoryAllocator.GetAllocatedMemorySize(ptr);
+                return memoryAllocator.GetAllocatedMemorySize(ptr);
+            }
+        }
+
+        /// <summary>
+        ///     Returns percent of heap segments consumed (for diagnostic use by galmalloc)
+        /// </summary>
+        public int HeapPercentUsed
+        {
+            get
+            {
+                lock (_heapLock)
+                {
+                    var segmentsUsed = _nextHeapPointer.Segment - HEAP_BASE_SEGMENT;
+                    var totalSegments = HEAP_CEILING_SEGMENT - HEAP_BASE_SEGMENT;
+                    return segmentsUsed * 100 / totalSegments;
+                }
+            }
         }
 
         public string ToHexString(FarPtr ptr, int length)
@@ -90,14 +160,18 @@ namespace MBBSEmu.Memory
         {
             base.Clear();
 
-            Array.Clear(_memorySegments, 0, _memorySegments.Length);
-            Array.Clear(_segments, 0, _segments.Length);
-            Array.Clear(_decompiledSegments, 0, _decompiledSegments.Length);
+            lock (_heapLock)
+            {
+                Array.Clear(_memorySegments, 0, _memorySegments.Length);
+                Array.Clear(_segments, 0, _segments.Length);
+                Array.Clear(_decompiledSegments, 0, _decompiledSegments.Length);
 
-            _nextHeapPointer = new FarPtr(HEAP_BASE_SEGMENT, 0);
-            _currentRealModePointer = new FarPtr(REALMODE_BASE_SEGMENT, 0);
-            _bigMemoryBlocks.Clear();
-            _heapAllocators.Clear();
+                _nextHeapPointer = new FarPtr(HEAP_BASE_SEGMENT, 0);
+                _currentRealModePointer = new FarPtr(REALMODE_BASE_SEGMENT, 0);
+                _bigMemoryBlocks.Clear();
+                _heapAllocators.Clear();
+                _lastAllocator = null;
+            }
         }
 
         /// <summary>
@@ -244,12 +318,19 @@ namespace MBBSEmu.Memory
         public override FarPtr GetBigMemoryBlock(FarPtr block, ushort index) => _bigMemoryBlocks[block.Offset][index];
 
         /// <summary>
-        ///     Returns a newly allocated Segment in "Real Mode" memory
+        ///     Returns a newly allocated Segment in "Real Mode" memory.
+        ///     Skips over any segment numbers already in use (e.g. by the heap allocator)
+        ///     to prevent collisions.
         /// </summary>
         /// <returns></returns>
         public override FarPtr AllocateRealModeSegment(ushort segmentSize = ushort.MaxValue)
         {
-            _currentRealModePointer.Segment++;
+            do
+            {
+                _currentRealModePointer.Segment++;
+            } while (_memorySegments[_currentRealModePointer.Segment] != null &&
+                     _currentRealModePointer.Segment < 0xFFFF);
+
             var realModeSegment = new FarPtr(_currentRealModePointer);
             AddSegment(realModeSegment.Segment, segmentSize);
             return realModeSegment;
