@@ -30,6 +30,8 @@ namespace MBBSEmu.Memory
 
         private MemoryAllocator _memoryAllocator;
 
+        private readonly object _memoryLock = new();
+
         /// <summary>
         ///     CodeReader implementation which feeds the Iced.Intel
         ///     decoder based on our current IP.
@@ -77,38 +79,50 @@ namespace MBBSEmu.Memory
 
         public override FarPtr Malloc(uint size)
         {
-            var ptr = _memoryAllocator.Malloc(size);
-            if (ptr.IsNull())
-                return ptr;
+            lock (_memoryLock)
+            {
+                var ptr = _memoryAllocator.Malloc(size);
+                if (ptr.IsNull())
+                    return ptr;
 
-            // ptr is returned with segment = 0x1000 and an offset, so change ptr to have 0 offset
-            // by incrementing segment.
-            return new FarPtr((ushort)(ptr.Segment + (ptr.Offset >> 4)), 0);
+                // ptr is returned with segment = 0x1000 and an offset, so change ptr to have 0 offset
+                // by incrementing segment.
+                return new FarPtr((ushort)(ptr.Segment + (ptr.Offset >> 4)), 0);
+            }
         }
         public override void Free(FarPtr ptr)
         {
             if (ptr.IsNull())
                 return;
 
-            // ptr should have 0 offset, but we need to reconvert back to segment 0x1000 base.
-            var adjustedPtr = new FarPtr(_heapBaseSegment, (ushort)(ptr.Offset + ((ptr.Segment - _heapBaseSegment) << 4)));
-            _memoryAllocator.Free(adjustedPtr);
+            lock (_memoryLock)
+            {
+                // ptr should have 0 offset, but we need to reconvert back to segment 0x1000 base.
+                var adjustedPtr = new FarPtr(_heapBaseSegment, (ushort)(ptr.Offset + ((ptr.Segment - _heapBaseSegment) << 4)));
+                _memoryAllocator.Free(adjustedPtr);
+            }
         }
 
         public int GetAllocatedMemorySize(FarPtr ptr)
         {
-            // ptr should have 0 offset, but we need to reconvert back to segment 0x1000 base.
-            var adjustedPtr = new FarPtr(_heapBaseSegment, (ushort)(ptr.Offset + ((ptr.Segment - _heapBaseSegment) << 4)));
-            return _memoryAllocator.GetAllocatedMemorySize(adjustedPtr);
+            lock (_memoryLock)
+            {
+                // ptr should have 0 offset, but we need to reconvert back to segment 0x1000 base.
+                var adjustedPtr = new FarPtr(_heapBaseSegment, (ushort)(ptr.Offset + ((ptr.Segment - _heapBaseSegment) << 4)));
+                return _memoryAllocator.GetAllocatedMemorySize(adjustedPtr);
+            }
         }
 
         public Instruction GetInstruction(ushort segment, ushort instructionPointer)
         {
-            var physicalAddress = VirtualToPhysicalAddress(segment, instructionPointer);
-            _codeReader.SetCurrent(physicalAddress);
+            lock (_memoryLock)
+            {
+                var physicalAddress = VirtualToPhysicalAddress(segment, instructionPointer);
+                _codeReader.SetCurrent(physicalAddress);
 
-            _decoder.IP = instructionPointer;
-            return _decoder.Decode();
+                _decoder.IP = instructionPointer;
+                return _decoder.Decode();
+            }
         }
 
         public Instruction Recompile(ushort segment, ushort instructionPointer) => GetInstruction(segment, instructionPointer);
@@ -120,8 +134,11 @@ namespace MBBSEmu.Memory
         {
             base.Clear();
 
-            _memoryAllocator = new MemoryAllocator(_logger, new FarPtr(_heapBaseSegment, 0), HEAP_MAX_SIZE, alignment: 16);
-            Array.Fill(_memory, (byte)0);
+            lock (_memoryLock)
+            {
+                _memoryAllocator = new MemoryAllocator(_logger, new FarPtr(_heapBaseSegment, 0), HEAP_MAX_SIZE, alignment: 16);
+                Array.Fill(_memory, (byte)0);
+            }
         }
 
         public ReadOnlySpan<byte> GetMemorySegment(ushort segment) => _memory.AsSpan();

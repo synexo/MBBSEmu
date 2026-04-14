@@ -1,4 +1,4 @@
-﻿using Iced.Intel;
+using Iced.Intel;
 using MBBSEmu.Disassembler.Artifacts;
 using MBBSEmu.Logging;
 using System;
@@ -37,7 +37,7 @@ namespace MBBSEmu.Memory
         ///     in Malloc races with Add in the new-segment path, and the LinkedList free
         ///     lists inside each MemoryAllocator corrupt silently.
         /// </summary>
-        private readonly object _heapLock = new();
+        private readonly object _memoryLock = new();
 
         /// <summary>
         ///     Tracks the most recently created heap allocator so Malloc can try it first,
@@ -53,7 +53,7 @@ namespace MBBSEmu.Memory
 
         public override FarPtr Malloc(uint size)
         {
-            lock (_heapLock)
+            lock (_memoryLock)
             {
                 // Fast path: try the most recently created allocator first.
                 // The vast majority of allocations succeed here, avoiding the
@@ -109,7 +109,7 @@ namespace MBBSEmu.Memory
             if (ptr.IsNull())
                 return;
 
-            lock (_heapLock)
+            lock (_memoryLock)
             {
                 if (!_heapAllocators.TryGetValue(ptr.Segment, out var memoryAllocator))
                 {
@@ -123,7 +123,7 @@ namespace MBBSEmu.Memory
 
         public int GetAllocatedMemorySize(FarPtr ptr)
         {
-            lock (_heapLock)
+            lock (_memoryLock)
             {
                 if (!_heapAllocators.TryGetValue(ptr.Segment, out var memoryAllocator))
                     return -1;
@@ -139,7 +139,7 @@ namespace MBBSEmu.Memory
         {
             get
             {
-                lock (_heapLock)
+                lock (_memoryLock)
                 {
                     var segmentsUsed = _nextHeapPointer.Segment - HEAP_BASE_SEGMENT;
                     var totalSegments = HEAP_CEILING_SEGMENT - HEAP_BASE_SEGMENT;
@@ -160,7 +160,7 @@ namespace MBBSEmu.Memory
         {
             base.Clear();
 
-            lock (_heapLock)
+            lock (_memoryLock)
             {
                 Array.Clear(_memorySegments, 0, _memorySegments.Length);
                 Array.Clear(_segments, 0, _segments.Length);
@@ -181,10 +181,13 @@ namespace MBBSEmu.Memory
         /// <param name="size"></param>
         public void AddSegment(ushort segmentNumber, int size = 0x10000)
         {
-            if (_memorySegments[segmentNumber] != null)
-                throw new Exception($"Segment with number {segmentNumber} already defined");
+            lock (_memoryLock)
+            {
+                if (_memorySegments[segmentNumber] != null)
+                    throw new Exception($"Segment with number {segmentNumber} already defined");
 
-            _memorySegments[segmentNumber] = new byte[size];
+                _memorySegments[segmentNumber] = new byte[size];
+            }
         }
 
         /// <summary>
@@ -193,9 +196,12 @@ namespace MBBSEmu.Memory
         /// <param name="segment"></param>
         public void RemoveSegment(ushort segment)
         {
-            _memorySegments[segment] = null;
-            _segments[segment] = null;
-            _decompiledSegments[segment] = null;
+            lock (_memoryLock)
+            {
+                _memorySegments[segment] = null;
+                _segments[segment] = null;
+                _decompiledSegments[segment] = null;
+            }
         }
 
         /// <summary>
@@ -204,34 +210,37 @@ namespace MBBSEmu.Memory
         /// <param name="segment"></param>
         public void AddSegment(Segment segment)
         {
-            //Get Address for this Segment
-            var segmentMemory = new byte[0x10000];
-
-            //Add the data to memory and record the segment offset in memory
-            Array.Copy(segment.Data, 0, segmentMemory, 0, segment.Data.Length);
-            _memorySegments[segment.Ordinal] = segmentMemory;
-
-            if (segment.Flags.Contains(EnumSegmentFlags.Code))
+            lock (_memoryLock)
             {
-                //Decode the Segment
-                var instructionList = new InstructionList();
-                var codeReader = new ByteArrayCodeReader(segment.Data);
-                var decoder = Decoder.Create(16, codeReader);
-                decoder.IP = 0x0;
+                //Get Address for this Segment
+                var segmentMemory = new byte[0x10000];
 
-                while (decoder.IP < (ulong)segment.Data.Length)
+                //Add the data to memory and record the segment offset in memory
+                Array.Copy(segment.Data, 0, segmentMemory, 0, segment.Data.Length);
+                _memorySegments[segment.Ordinal] = segmentMemory;
+
+                if (segment.Flags.Contains(EnumSegmentFlags.Code))
                 {
-                    decoder.Decode(out instructionList.AllocUninitializedElement());
+                    //Decode the Segment
+                    var instructionList = new InstructionList();
+                    var codeReader = new ByteArrayCodeReader(segment.Data);
+                    var decoder = Decoder.Create(16, codeReader);
+                    decoder.IP = 0x0;
+
+                    while (decoder.IP < (ulong)segment.Data.Length)
+                    {
+                        decoder.Decode(out instructionList.AllocUninitializedElement());
+                    }
+
+                    _decompiledSegments[segment.Ordinal] = new Instruction[0x10000];
+                    foreach (var i in instructionList)
+                    {
+                        _decompiledSegments[segment.Ordinal][i.IP16] = i;
+                    }
                 }
 
-                _decompiledSegments[segment.Ordinal] = new Instruction[0x10000];
-                foreach (var i in instructionList)
-                {
-                    _decompiledSegments[segment.Ordinal][i.IP16] = i;
-                }
+                _segments[segment.Ordinal] = segment;
             }
-
-            _segments[segment.Ordinal] = segment;
         }
 
         /// <summary>
@@ -241,10 +250,13 @@ namespace MBBSEmu.Memory
         /// <param name="segmentInstructionList"></param>
         public void AddSegment(ushort segmentNumber, InstructionList segmentInstructionList)
         {
-            _decompiledSegments[segmentNumber] = new Instruction[0x10000];
-            foreach (var i in segmentInstructionList)
+            lock (_memoryLock)
             {
-                _decompiledSegments[segmentNumber][i.IP16] = i;
+                _decompiledSegments[segmentNumber] = new Instruction[0x10000];
+                foreach (var i in segmentInstructionList)
+                {
+                    _decompiledSegments[segmentNumber][i.IP16] = i;
+                }
             }
         }
 
@@ -300,13 +312,16 @@ namespace MBBSEmu.Memory
         /// <returns></returns>
         public override FarPtr AllocateBigMemoryBlock(ushort quantity, ushort size)
         {
-            var newBlockOffset = _bigMemoryBlocks.Allocate(new Dictionary<ushort, FarPtr>());
+            lock (_memoryLock)
+            {
+                var newBlockOffset = _bigMemoryBlocks.Allocate(new Dictionary<ushort, FarPtr>());
 
-            //Fill the Region
-            for (ushort i = 0; i < quantity; i++)
-                _bigMemoryBlocks[newBlockOffset].Add(i, AllocateVariable($"ALCBLOK-{newBlockOffset}-{i}", size));
+                //Fill the Region
+                for (ushort i = 0; i < quantity; i++)
+                    _bigMemoryBlocks[newBlockOffset].Add(i, AllocateVariable($"ALCBLOK-{newBlockOffset}-{i}", size));
 
-            return new FarPtr(0xFFFF, (ushort)newBlockOffset);
+                return new FarPtr(0xFFFF, (ushort)newBlockOffset);
+            }
         }
 
         /// <summary>
@@ -315,7 +330,13 @@ namespace MBBSEmu.Memory
         /// <param name="block"></param>
         /// <param name="index"></param>
         /// <returns></returns>
-        public override FarPtr GetBigMemoryBlock(FarPtr block, ushort index) => _bigMemoryBlocks[block.Offset][index];
+        public override FarPtr GetBigMemoryBlock(FarPtr block, ushort index)
+        {
+            lock (_memoryLock)
+            {
+                return _bigMemoryBlocks[block.Offset][index];
+            }
+        }
 
         /// <summary>
         ///     Returns a newly allocated Segment in "Real Mode" memory.
@@ -325,15 +346,23 @@ namespace MBBSEmu.Memory
         /// <returns></returns>
         public override FarPtr AllocateRealModeSegment(ushort segmentSize = ushort.MaxValue)
         {
-            do
+            lock (_memoryLock)
             {
-                _currentRealModePointer.Segment++;
-            } while (_memorySegments[_currentRealModePointer.Segment] != null &&
-                     _currentRealModePointer.Segment < 0xFFFF);
+                do
+                {
+                    _currentRealModePointer.Segment++;
+                } while (_currentRealModePointer.Segment < 0xFFFF &&
+                         _memorySegments[_currentRealModePointer.Segment] != null);
 
-            var realModeSegment = new FarPtr(_currentRealModePointer);
-            AddSegment(realModeSegment.Segment, segmentSize);
-            return realModeSegment;
+                if (_currentRealModePointer.Segment == 0xFFFF || _currentRealModePointer.Segment == 0)
+                {
+                    throw new OutOfMemoryException("Real Mode Segments exhausted");
+                }
+
+                var realModeSegment = new FarPtr(_currentRealModePointer);
+                AddSegment(realModeSegment.Segment, segmentSize);
+                return realModeSegment;
+            }
         }
 
         public ReadOnlySpan<byte> GetMemorySegment(ushort segment) => _memorySegments[segment];
