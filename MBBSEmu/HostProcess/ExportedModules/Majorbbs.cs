@@ -158,6 +158,11 @@ namespace MBBSEmu.HostProcess.ExportedModules
             var usaptrPointer = Module.Memory.AllocateVariable("USAPTR", 0x4);
             Module.Memory.SetArray(usaptrPointer, usraccPointer.Data);
 
+            //Diagnostics: substt write-watch (enabled via MBBSEMU_SUBSTT_TRACE)
+            _substtTracer = MBBSEmu.Diagnostics.SubsttTracer.TryCreate(Module.ModuleIdentifier, Module.ModulePath, Module.Memory,
+                Module.Memory.GetVariablePointer("USER"), _numberOfChannels, ChannelDictionary, () => ChannelNumber,
+                Module.Memory.GetVariablePointer("USRNUM"), Module.Memory.GetVariablePointer("*USRPTR"));
+
             var usrExtPointer = Module.Memory.AllocateVariable("EXTUSR", (ushort)(ExtUser.Size * _numberOfChannels), true);
             var extPtrPointer = Module.Memory.AllocateVariable("EXTPTR", 0x4);
             Module.Memory.SetArray(extPtrPointer, usrExtPointer.Data);
@@ -306,7 +311,17 @@ namespace MBBSEmu.HostProcess.ExportedModules
         /// </summary>
         /// <param name="channelNumber"></param>
         /// <param name="numberOfModules"></param>
+        private readonly MBBSEmu.Diagnostics.SubsttTracer _substtTracer;
+
         public void SetState(ushort channelNumber)
+        {
+            var prevHostOp = MBBSEmu.Diagnostics.SubsttTracer.HostOp;
+            MBBSEmu.Diagnostics.SubsttTracer.HostOp = $"SetState({channelNumber})";
+            try { SetStateCore(channelNumber); }
+            finally { MBBSEmu.Diagnostics.SubsttTracer.HostOp = prevHostOp; }
+        }
+
+        private void SetStateCore(ushort channelNumber)
         {
             ResetLocalVariableOrdinals();
             ChannelNumber = channelNumber;
@@ -4709,10 +4724,21 @@ namespace MBBSEmu.HostProcess.ExportedModules
 
             if (newUserNumber != ushort.MaxValue && !ChannelDictionary.ContainsKey(newUserNumber))
             {
+                _substtTracer?.CurusrBail(newUserNumber);
 #if DEBUG
                 _logger.Debug($"({Module.ModuleIdentifier}) Invalid Channel: {newUserNumber}");
 #endif
                 return;
+            }
+
+            //Diagnostics: SetState() will re-run ProcessChannelInput() for a channel whose status is still
+            //CR_TERMINATED_STRING_AVAILABLE, overwriting INPUT/MARGV that the caller may have prepared
+            if (_substtTracer != null && newUserNumber != ushort.MaxValue &&
+                ChannelDictionary[newUserNumber].GetStatus() == EnumUserStatus.CR_TERMINATED_STRING_AVAILABLE)
+            {
+                var before = Encoding.ASCII.GetString(Module.Memory.GetString(Module.Memory.GetVariablePointer("INPUT"), true));
+                var after = Encoding.ASCII.GetString(ChannelDictionary[newUserNumber].InputCommand ?? Array.Empty<byte>()).TrimEnd('\0');
+                _substtTracer.Note($"CURUSR-REPARSE from={ChannelNumber} to={newUserNumber} INPUT \"{before}\" -> \"{after}\"");
             }
 
             //Save the Current Channel

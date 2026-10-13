@@ -122,8 +122,16 @@ namespace MBBSEmu.HostProcess.ExecutionUnits
             }
 
             //Run until complete
-            while (!ModuleCpuRegisters.Halt)
-                ModuleCpu.Tick();
+            MBBSEmu.Diagnostics.SubsttTracer.PushContext(ModuleCpuRegisters, channelNumber, entryPoint);
+            try
+            {
+                while (!ModuleCpuRegisters.Halt)
+                    ModuleCpu.Tick();
+            }
+            finally
+            {
+                MBBSEmu.Diagnostics.SubsttTracer.PopContext();
+            }
 
             //Return Registers if we're not updating state on exit
             if (bypassState || channelNumber == ushort.MaxValue || initialStackValues is { Count: > 0 })

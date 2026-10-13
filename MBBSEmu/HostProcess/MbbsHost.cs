@@ -532,6 +532,7 @@ namespace MBBSEmu.HostProcess
                 incomingSession.Channel = (ushort)_channelDictionary.Allocate(incomingSession);
                 incomingSession.SessionTimer.Start();
                 Logger.Info($"Added Session {incomingSession.SessionId} to channel {incomingSession.Channel}");
+                MBBSEmu.Diagnostics.SubsttTracer.NoteAll($"AddSession ch={incomingSession.Channel} id={incomingSession.SessionId}");
             }
         }
 
@@ -667,6 +668,7 @@ namespace MBBSEmu.HostProcess
 
             //Reset States
             session.Status.Clear();
+            MBBSEmu.Diagnostics.SubsttTracer.NoteAll($"ExitModule ch={session.Channel} user={session.Username} (C# Substt=0)");
             session.UsrPtr.Substt = 0;
 
             //Clear the Input Buffer
@@ -1156,6 +1158,7 @@ namespace MBBSEmu.HostProcess
             }
 
             Logger.Info($"Removing Channel: {channel}");
+            MBBSEmu.Diagnostics.SubsttTracer.NoteAll($"RemoveSession ch={channel} user={_channelDictionary[channel].Username} state={_channelDictionary[channel].SessionState}");
 
             CallModuleRoutine("huprou", preRunCallback: null, channel);
 
