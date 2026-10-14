@@ -118,11 +118,33 @@ namespace MBBSEmu.Diagnostics
         }
 
         /// <summary>curusr() refused a channel - always logged, this is the wrong-user hazard.</summary>
+        private long _emptyBails;
+        private DateTime _lastEmptyBailSummary = DateTime.MinValue;
+
         public void CurusrBail(ushort requested)
         {
             lock (_lock)
             {
-                var line = $"{DateTime.Now:HH:mm:ss.fff} CURUSR-BAIL req={requested} hostCh={Ch(_hostChannelNumber())} {HostInfo()} ctx={Ctx()} at={Where()}";
+                // MajorMUD's sweeps call CURUSR on every channel up to nterms, so channels nobody has ever
+                // used bail on every sweep. Those are harmless noise: count them, summarise every 10 minutes.
+                // A bail on a slot that still holds data (state/substt != 0) is a GHOST - always log it.
+                ushort st = 0, su = 0;
+                if (requested < _slots)
+                {
+                    st = _mem.GetWord(_seg, (ushort)(_base + requested * UserSize + StateOff));
+                    su = _mem.GetWord(_seg, (ushort)(_base + requested * UserSize + SubsttOff));
+                }
+                if (st == 0 && su == 0)
+                {
+                    _emptyBails++;
+                    if ((DateTime.Now - _lastEmptyBailSummary).TotalMinutes >= 10)
+                    {
+                        _lastEmptyBailSummary = DateTime.Now;
+                        Write($"{DateTime.Now:HH:mm:ss.fff} CURUSR-BAIL-EMPTY total={_emptyBails} (unused channel slots; expected, not logged individually)");
+                    }
+                    return;
+                }
+                var line = $"{DateTime.Now:HH:mm:ss.fff} CURUSR-BAIL GHOST req={requested} slot state={st} substt={su:X} hostCh={Ch(_hostChannelNumber())} {HostInfo()} ctx={Ctx()} at={Where()}";
                 Add(line);
                 Write(line);
             }
