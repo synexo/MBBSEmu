@@ -11,6 +11,7 @@ using MBBSEmu.HostProcess.HostRoutines;
 using MBBSEmu.IO;
 using MBBSEmu.Logging;
 using MBBSEmu.Memory;
+using MBBSEmu.HostProcess.Structs;
 using MBBSEmu.Module;
 using MBBSEmu.Reports;
 using MBBSEmu.Session;
@@ -1162,6 +1163,11 @@ namespace MBBSEmu.HostProcess
 
             CallModuleRoutine("huprou", preRunCallback: null, channel);
 
+            //FIX (silent MajorMUD kicks): clear this channel's USER[] record in every module once its hangup
+            //routine has run. Otherwise the record keeps saying "in module X" after the session is gone, and
+            //modules that sweep all channels (MajorMUD's background routines) keep treating it as a player.
+            ClearUserRecord(channel);
+
             var session = _channelDictionary[channel];
             session.Stop();
             session.SessionState = EnumSessionState.Disconnected;
@@ -1169,6 +1175,34 @@ namespace MBBSEmu.HostProcess
             _channelDictionary.Remove(channel);
 
             return true;
+        }
+
+        /// <summary>
+        ///     Zeroes USER[channel] in every loaded module's memory (state/substt/flags etc.).
+        ///     A new session on this channel reloads the record from its own UsrPtr on SetState().
+        /// </summary>
+        private void ClearUserRecord(ushort channel)
+        {
+            var prevHostOp = MBBSEmu.Diagnostics.SubsttTracer.HostOp;
+            MBBSEmu.Diagnostics.SubsttTracer.HostOp = $"RemoveSession({channel})";
+            try
+            {
+                foreach (var m in _modules.Values)
+                {
+                    if (!m.Memory.TryGetVariablePointer("USER", out var userBase)) continue;
+                    if (channel >= m.Memory.GetWord("NTERMS")) continue;
+                    var slot = new FarPtr(userBase.Segment, (ushort)(userBase.Offset + User.Size * channel));
+                    m.Memory.SetZero(slot, User.Size);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"Failed clearing USER record for channel {channel}: {ex.Message}");
+            }
+            finally
+            {
+                MBBSEmu.Diagnostics.SubsttTracer.HostOp = prevHostOp;
+            }
         }
 
         /// <summary>

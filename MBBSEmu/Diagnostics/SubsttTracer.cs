@@ -112,6 +112,12 @@ namespace MBBSEmu.Diagnostics
                         Write($"{DateTime.Now:HH:mm:ss.fff} NOTE {what}");
                     return;
                 }
+                if (what.StartsWith("AddSession ch=") && int.TryParse(what.Substring(14).Split(' ')[0], out var ach))
+                {
+                    if (_ghostRepeats.GetValueOrDefault(ach) > 0)
+                        Write($"{DateTime.Now:HH:mm:ss.fff} GHOST-END ch={ach} reused; suppressed repeats={_ghostRepeats[ach]}");
+                    _ghostLast.Remove(ach); _ghostRepeats.Remove(ach);
+                }
                 Add($"{DateTime.Now:HH:mm:ss.fff} NOTE {what}");
                 if (_logAll) Write($"{DateTime.Now:HH:mm:ss.fff} NOTE {what}");
             }
@@ -119,6 +125,8 @@ namespace MBBSEmu.Diagnostics
 
         /// <summary>curusr() refused a channel - always logged, this is the wrong-user hazard.</summary>
         private long _emptyBails;
+        private readonly Dictionary<int, int> _ghostLast = new();
+        private readonly Dictionary<int, long> _ghostRepeats = new();
         private DateTime _lastEmptyBailSummary = DateTime.MinValue;
 
         public void CurusrBail(ushort requested)
@@ -144,7 +152,17 @@ namespace MBBSEmu.Diagnostics
                     }
                     return;
                 }
-                var line = $"{DateTime.Now:HH:mm:ss.fff} CURUSR-BAIL GHOST req={requested} slot state={st} substt={su:X} hostCh={Ch(_hostChannelNumber())} {HostInfo()} ctx={Ctx()} at={Where()}";
+                // Same ghost, same leftover values as last time: count instead of logging every sweep.
+                // Dangerous ghosts (substt >= realmMin, i.e. MajorMUD thinks they're in the game) are always logged.
+                var key = (st << 16) | su;
+                if (su < _realmMin && _ghostLast.TryGetValue(requested, out var prev) && prev == key)
+                {
+                    _ghostRepeats[requested] = _ghostRepeats.GetValueOrDefault(requested) + 1;
+                    return;
+                }
+                _ghostLast[requested] = key;
+                var reps = _ghostRepeats.GetValueOrDefault(requested); _ghostRepeats[requested] = 0;
+                var line = $"{DateTime.Now:HH:mm:ss.fff} CURUSR-BAIL GHOST{(su >= _realmMin ? " IN-GAME" : "")} req={requested} (prior repeats={reps}) slot state={st} substt={su:X} hostCh={Ch(_hostChannelNumber())} {HostInfo()} ctx={Ctx()} at={Where()}";
                 Add(line);
                 Write(line);
             }
@@ -180,7 +198,8 @@ namespace MBBSEmu.Diagnostics
                         var line = $"{DateTime.Now:HH:mm:ss.fff} slot={Ch(k)} state {oState}->{nState} substt {oSub:X}->{nSub:X} " +
                                    $"len={length} host={HostOp ?? "-"} hostCh={Ch(_hostChannelNumber())} {HostInfo()} ctx={Ctx()} at={Where()}";
                         Add(line);
-                        bool realmExit = oSub >= _realmMin && oSub < 0x100 && nSub < _realmMin;
+                        bool realmExit = oSub >= _realmMin && oSub < 0x100 && nSub < _realmMin
+                                         && !(HostOp?.StartsWith("RemoveSession") ?? false); // record cleanup after disconnect, not a kick
                         if (realmExit || _logAll)
                         {
                             var sb = new StringBuilder();
