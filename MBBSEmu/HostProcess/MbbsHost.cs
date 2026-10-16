@@ -323,6 +323,13 @@ namespace MBBSEmu.HostProcess
                 {
                     try
                     {
+                        //byenow() was called for this session: ignore input, disconnect once output is sent
+                        if (session.ByeByeDeadline != null)
+                        {
+                            ProcessByeBye(session);
+                            continue;
+                        }
+
                         //Process a single incoming byte from the client session
                         session.ProcessDataFromClient();
 
@@ -1175,6 +1182,28 @@ namespace MBBSEmu.HostProcess
             _channelDictionary.Remove(channel);
 
             return true;
+        }
+
+        /// <summary>
+        ///     Completes a byenow(): discards input, and once all output has been sent (or the deadline passed)
+        ///     moves the session to LoggingOffProcessing, which closes the connection; the normal disconnect
+        ///     path then runs every module's huprou (MAJORBBS.C finbye() -> imdrop()).
+        /// </summary>
+        private void ProcessByeBye(SessionBase session)
+        {
+            //btulok(): no further input is accepted from a channel that is going away
+            while (session.DataFromClient.TryTake(out _)) { }
+            session.InputBuffer.SetLength(0);
+
+            if (session.SessionState is EnumSessionState.LoggingOffProcessing or EnumSessionState.LoggedOff
+                or EnumSessionState.Disconnected)
+                return;
+
+            if (session.DataToClient.Count == 0 || Clock.Now >= session.ByeByeDeadline)
+            {
+                Logger.Info($"Channel {session.Channel} ({session.Username}) disconnected by byenow()");
+                session.SessionState = EnumSessionState.LoggingOffProcessing;
+            }
         }
 
         /// <summary>
