@@ -11,6 +11,7 @@ using MBBSEmu.HostProcess.HostRoutines;
 using MBBSEmu.IO;
 using MBBSEmu.Logging;
 using MBBSEmu.Memory;
+using MBBSEmu.HostProcess.Structs;
 using MBBSEmu.Module;
 using MBBSEmu.Reports;
 using MBBSEmu.Session;
@@ -322,6 +323,13 @@ namespace MBBSEmu.HostProcess
                 {
                     try
                     {
+                        //byenow() was called for this session: ignore input, disconnect once output is sent
+                        if (session.ByeByeDeadline != null)
+                        {
+                            ProcessByeBye(session);
+                            continue;
+                        }
+
                         //Process a single incoming byte from the client session
                         session.ProcessDataFromClient();
 
@@ -532,6 +540,7 @@ namespace MBBSEmu.HostProcess
                 incomingSession.Channel = (ushort)_channelDictionary.Allocate(incomingSession);
                 incomingSession.SessionTimer.Start();
                 Logger.Info($"Added Session {incomingSession.SessionId} to channel {incomingSession.Channel}");
+                MBBSEmu.Diagnostics.SubsttTracer.NoteAll($"AddSession ch={incomingSession.Channel} id={incomingSession.SessionId}");
             }
         }
 
@@ -667,6 +676,7 @@ namespace MBBSEmu.HostProcess
 
             //Reset States
             session.Status.Clear();
+            MBBSEmu.Diagnostics.SubsttTracer.NoteAll($"ExitModule ch={session.Channel} user={session.Username} (C# Substt=0)");
             session.UsrPtr.Substt = 0;
 
             //Clear the Input Buffer
@@ -1156,8 +1166,14 @@ namespace MBBSEmu.HostProcess
             }
 
             Logger.Info($"Removing Channel: {channel}");
+            MBBSEmu.Diagnostics.SubsttTracer.NoteAll($"RemoveSession ch={channel} user={_channelDictionary[channel].Username} state={_channelDictionary[channel].SessionState}");
 
             CallModuleRoutine("huprou", preRunCallback: null, channel);
+
+            //FIX (silent MajorMUD kicks): clear this channel's USER[] record in every module once its hangup
+            //routine has run. Otherwise the record keeps saying "in module X" after the session is gone, and
+            //modules that sweep all channels (MajorMUD's background routines) keep treating it as a player.
+            ClearUserRecord(channel);
 
             var session = _channelDictionary[channel];
             session.Stop();
@@ -1166,6 +1182,56 @@ namespace MBBSEmu.HostProcess
             _channelDictionary.Remove(channel);
 
             return true;
+        }
+
+        /// <summary>
+        ///     Completes a byenow(): discards input, and once all output has been sent (or the deadline passed)
+        ///     moves the session to LoggingOffProcessing, which closes the connection; the normal disconnect
+        ///     path then runs every module's huprou (MAJORBBS.C finbye() -> imdrop()).
+        /// </summary>
+        private void ProcessByeBye(SessionBase session)
+        {
+            //btulok(): no further input is accepted from a channel that is going away
+            while (session.DataFromClient.TryTake(out _)) { }
+            session.InputBuffer.SetLength(0);
+
+            if (session.SessionState is EnumSessionState.LoggingOffProcessing or EnumSessionState.LoggedOff
+                or EnumSessionState.Disconnected)
+                return;
+
+            if (session.DataToClient.Count == 0 || Clock.Now >= session.ByeByeDeadline)
+            {
+                Logger.Info($"Channel {session.Channel} ({session.Username}) disconnected by byenow()");
+                session.SessionState = EnumSessionState.LoggingOffProcessing;
+            }
+        }
+
+        /// <summary>
+        ///     Zeroes USER[channel] in every loaded module's memory (state/substt/flags etc.).
+        ///     A new session on this channel reloads the record from its own UsrPtr on SetState().
+        /// </summary>
+        private void ClearUserRecord(ushort channel)
+        {
+            var prevHostOp = MBBSEmu.Diagnostics.SubsttTracer.HostOp;
+            MBBSEmu.Diagnostics.SubsttTracer.HostOp = $"RemoveSession({channel})";
+            try
+            {
+                foreach (var m in _modules.Values)
+                {
+                    if (!m.Memory.TryGetVariablePointer("USER", out var userBase)) continue;
+                    if (channel >= m.Memory.GetWord("NTERMS")) continue;
+                    var slot = new FarPtr(userBase.Segment, (ushort)(userBase.Offset + User.Size * channel));
+                    m.Memory.SetZero(slot, User.Size);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"Failed clearing USER record for channel {channel}: {ex.Message}");
+            }
+            finally
+            {
+                MBBSEmu.Diagnostics.SubsttTracer.HostOp = prevHostOp;
+            }
         }
 
         /// <summary>

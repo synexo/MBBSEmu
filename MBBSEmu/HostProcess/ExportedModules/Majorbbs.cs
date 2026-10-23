@@ -158,6 +158,11 @@ namespace MBBSEmu.HostProcess.ExportedModules
             var usaptrPointer = Module.Memory.AllocateVariable("USAPTR", 0x4);
             Module.Memory.SetArray(usaptrPointer, usraccPointer.Data);
 
+            //Diagnostics: substt write-watch (enabled via MBBSEMU_SUBSTT_TRACE)
+            _substtTracer = MBBSEmu.Diagnostics.SubsttTracer.TryCreate(Module.ModuleIdentifier, Module.ModulePath, Module.Memory,
+                Module.Memory.GetVariablePointer("USER"), _numberOfChannels, ChannelDictionary, () => ChannelNumber,
+                Module.Memory.GetVariablePointer("USRNUM"), Module.Memory.GetVariablePointer("*USRPTR"));
+
             var usrExtPointer = Module.Memory.AllocateVariable("EXTUSR", (ushort)(ExtUser.Size * _numberOfChannels), true);
             var extPtrPointer = Module.Memory.AllocateVariable("EXTPTR", 0x4);
             Module.Memory.SetArray(extPtrPointer, usrExtPointer.Data);
@@ -306,7 +311,17 @@ namespace MBBSEmu.HostProcess.ExportedModules
         /// </summary>
         /// <param name="channelNumber"></param>
         /// <param name="numberOfModules"></param>
+        private readonly MBBSEmu.Diagnostics.SubsttTracer _substtTracer;
+
         public void SetState(ushort channelNumber)
+        {
+            var prevHostOp = MBBSEmu.Diagnostics.SubsttTracer.HostOp;
+            MBBSEmu.Diagnostics.SubsttTracer.HostOp = $"SetState({channelNumber})";
+            try { SetStateCore(channelNumber); }
+            finally { MBBSEmu.Diagnostics.SubsttTracer.HostOp = prevHostOp; }
+        }
+
+        private void SetStateCore(ushort channelNumber)
         {
             ResetLocalVariableOrdinals();
             ChannelNumber = channelNumber;
@@ -396,8 +411,8 @@ namespace MBBSEmu.HostProcess.ExportedModules
         /// <param name="channel"></param>
         public void UpdateSession(ushort channel)
         {
-            //Don't process on RTKICK, etc. runs
-            if (channel == ushort.MaxValue)
+            //Don't process on RTKICK, etc. runs, or while curusr() points at a vacant channel
+            if (channel == ushort.MaxValue || ChannelNumber == ushort.MaxValue)
                 return;
 
             //Set the Channel Status
@@ -2079,10 +2094,13 @@ namespace MBBSEmu.HostProcess.ExportedModules
         ///     Signature: void outprf (unum)
         /// </summary>
         /// <returns></returns>
-        private void outprf()
-        {
-            var userChannel = GetParameter(0);
+        private void outprf() => OutputPrfTo(GetParameter(0));
 
+        /// <summary>
+        ///     Sends the contents of prfbuf to the specified channel (if connected) and clears prfbuf
+        /// </summary>
+        private void OutputPrfTo(ushort userChannel)
+        {
             var basePointer = Module.Memory.GetVariablePointer("PRFBUF");
             var currentPointer = Module.Memory.GetPointer(Module.Memory.GetVariablePointer("PRFPTR"));
 
@@ -4709,10 +4727,32 @@ namespace MBBSEmu.HostProcess.ExportedModules
 
             if (newUserNumber != ushort.MaxValue && !ChannelDictionary.ContainsKey(newUserNumber))
             {
+                _substtTracer?.CurusrBail(newUserNumber);
+
+                //FIX (silent MajorMUD kicks): the original MAJORBBS.C curusr() switches to ANY channel
+                //0 <= uno < nterms, connected or not. Previously we returned here leaving USRNUM/*USRPTR on
+                //the previous (live) user, so a module sweeping all channels (e.g. MajorMUD's inactivity
+                //check) wrote to the wrong player. Now we point at the vacant channel's own records instead.
+                if (newUserNumber < Module.Memory.GetWord("NTERMS"))
+                {
+                    //Save the live channel we are leaving (no-op when not in a channel context)
+                    UpdateSession(ChannelNumber);
+                    PointAtVacantChannel(newUserNumber);
+                }
 #if DEBUG
-                _logger.Debug($"({Module.ModuleIdentifier}) Invalid Channel: {newUserNumber}");
+                _logger.Debug($"({Module.ModuleIdentifier}) Vacant/Invalid Channel: {newUserNumber}");
 #endif
                 return;
+            }
+
+            //Diagnostics: SetState() will re-run ProcessChannelInput() for a channel whose status is still
+            //CR_TERMINATED_STRING_AVAILABLE, overwriting INPUT/MARGV that the caller may have prepared
+            if (_substtTracer != null && newUserNumber != ushort.MaxValue &&
+                ChannelDictionary[newUserNumber].GetStatus() == EnumUserStatus.CR_TERMINATED_STRING_AVAILABLE)
+            {
+                var before = Encoding.ASCII.GetString(Module.Memory.GetString(Module.Memory.GetVariablePointer("INPUT"), true));
+                var after = Encoding.ASCII.GetString(ChannelDictionary[newUserNumber].InputCommand ?? Array.Empty<byte>()).TrimEnd('\0');
+                _substtTracer.Note($"CURUSR-REPARSE from={ChannelNumber} to={newUserNumber} INPUT \"{before}\" -> \"{after}\"");
             }
 
             //Save the Current Channel
@@ -4724,6 +4764,34 @@ namespace MBBSEmu.HostProcess.ExportedModules
 #if DEBUG
             _logger.Debug($"Setting Current User to {newUserNumber}");
 #endif
+        }
+
+        /// <summary>
+        ///     curusr() target with no connected session: point USRNUM, *USRPTR, USAPTR and EXTPTR at that
+        ///     channel's own slots (as MAJORBBS.C does) and VDAPTR at a shared scratch block. No session data
+        ///     is loaded and ChannelNumber becomes "no channel" (ushort.MaxValue), the same as an RTKICK/SYSCYC
+        ///     context, so nothing is saved back to any session from these slots.
+        /// </summary>
+        private void PointAtVacantChannel(ushort channel)
+        {
+            ChannelNumber = ushort.MaxValue;
+
+            Module.Memory.SetWord(Module.Memory.GetVariablePointer("USRNUM"), channel);
+
+            var user = new FarPtr(Module.Memory.GetVariablePointer("USER").Data);
+            user.Offset += (ushort)(User.Size * channel);
+            Module.Memory.SetArray(Module.Memory.GetVariablePointer("*USRPTR"), user.Data);
+
+            var usracc = new FarPtr(Module.Memory.GetVariablePointer("USRACC").Data);
+            usracc.Offset += (ushort)(UserAccount.Size * channel);
+            Module.Memory.SetArray(Module.Memory.GetVariablePointer("USAPTR"), usracc.Data);
+
+            var extusr = new FarPtr(Module.Memory.GetVariablePointer("EXTUSR").Data);
+            extusr.Offset += (ushort)(ExtUser.Size * channel);
+            Module.Memory.SetArray(Module.Memory.GetVariablePointer("EXTPTR"), extusr.Data);
+
+            var vacantVda = Module.Memory.GetOrAllocateVariablePointer("VDA-VACANT", VOLATILE_DATA_SIZE);
+            Module.Memory.SetArray(Module.Memory.GetVariablePointer("VDAPTR"), vacantVda.Data);
         }
 
         /// <summary>
@@ -4794,7 +4862,35 @@ namespace MBBSEmu.HostProcess.ExportedModules
         /// </summary>
         private void byenow()
         {
-            prfmsg();
+            //MAJORBBS.C byenow(): msgnum NOMSG (0) = silent, PAMSG (-1) = text already prf()'d
+            const short NOMSG = 0;
+            const short PAMSG = -1;
+            const int BYEBYE_TIMEOUT_SECONDS = 30; //original: byecnt=2 on a 15 second sweep (15-30s)
+
+            var msgnum = (short)GetParameter(0);
+
+            if (msgnum != NOMSG && msgnum != PAMSG)
+                prfmsg();
+
+            //usrnum is the implicit input
+            var userChannel = Module.Memory.GetWord(Module.Memory.GetVariablePointer("USRNUM"));
+
+            if (!ChannelDictionary.TryGetValue(userChannel, out var session))
+            {
+                //Nobody connected on that channel: nothing to hang up
+                if (msgnum != NOMSG)
+                    clrprf();
+                return;
+            }
+
+            //Send the good-bye text now, then hang up once it has gone out (see MbbsHost)
+            if (msgnum != NOMSG)
+                OutputPrfTo(userChannel);
+
+            session.InputBuffer.SetLength(0);
+            session.ByeByeDeadline ??= _clock.Now.AddSeconds(BYEBYE_TIMEOUT_SECONDS);
+
+            _logger.Info($"({Module.ModuleIdentifier}) byenow() on channel {userChannel} ({session.Username}) - disconnecting");
         }
 
         /// <summary>

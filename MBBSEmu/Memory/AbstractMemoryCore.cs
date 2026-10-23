@@ -12,6 +12,11 @@ namespace MBBSEmu.Memory
     /// </summary>
     public abstract class AbstractMemoryCore
     {
+        /// <summary>Diagnostics: segment whose writes are reported to <see cref="WriteObserver"/> (0xFFFF = none).</summary>
+        public ushort ObservedSegment = 0xFFFF;
+        /// <summary>Diagnostics: called AFTER a write to ObservedSegment (segment, offset, length).</summary>
+        public Action<ushort, ushort, int> WriteObserver;
+
         /// <summary>
         ///     Default Compiler Hints for use on methods within the MemoryCore
         ///
@@ -190,7 +195,11 @@ namespace MBBSEmu.Memory
         /// <param name="offset"></param>
         /// <param name="value"></param>
         [MethodImpl(CompilerOptimizations)]
-        public void SetByte(ushort segment, ushort offset, byte value) => VirtualToPhysical(segment, offset)[0] = value;
+        public void SetByte(ushort segment, ushort offset, byte value)
+        {
+            VirtualToPhysical(segment, offset)[0] = value;
+            if (segment == ObservedSegment) WriteObserver?.Invoke(segment, offset, 1);
+        }
 
         /// <summary>
         ///     Sets the specified word at the desired segment:offset
@@ -205,6 +214,7 @@ namespace MBBSEmu.Memory
             {
                 *((ushort*)dst) = value;
             }
+            if (segment == ObservedSegment) WriteObserver?.Invoke(segment, offset, 2);
         }
 
         [MethodImpl(CompilerOptimizations)]
@@ -214,6 +224,7 @@ namespace MBBSEmu.Memory
             {
                 *((uint*)dst) = value;
             }
+            if (segment == ObservedSegment) WriteObserver?.Invoke(segment, offset, 4);
         }
 
         [MethodImpl(CompilerOptimizations)]
@@ -221,6 +232,7 @@ namespace MBBSEmu.Memory
         {
             var destinationSpan = VirtualToPhysical(segment, offset);
             array.CopyTo(destinationSpan);
+            if (segment == ObservedSegment) WriteObserver?.Invoke(segment, offset, array.Length);
         }
 
         /// <summary>
@@ -233,6 +245,7 @@ namespace MBBSEmu.Memory
         public void FillArray(ushort segment, ushort offset, int count, byte value)
         {
             VirtualToPhysical(segment, offset).Slice(0, count).Fill(value);
+            if (segment == ObservedSegment) WriteObserver?.Invoke(segment, offset, count);
         }
 
         /// <summary>
